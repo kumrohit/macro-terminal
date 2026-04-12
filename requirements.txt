@@ -1,7 +1,7 @@
-streamlit==1.32.2
-feedparser==6.0.11
-requests==2.31.0
-pandas==2.2.1
-vaderSentiment==3.3.2
-yfinance==1.2.0
-google-genai==1.65.0
+streamlit
+feedparser
+requests
+pandas
+vaderSentiment
+yfinance
+google-genai
