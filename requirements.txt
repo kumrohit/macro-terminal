@@ -6,3 +6,4 @@ vaderSentiment
 yfinance
 google-genai
 plotly
+numpy

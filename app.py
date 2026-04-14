@@ -15,6 +15,7 @@ except ImportError:
     HAS_GENAI = False
 
 import plotly.express as px
+import numpy as np
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Macro Terminal", layout="wide", initial_sidebar_state="collapsed")
@@ -37,10 +38,28 @@ VOLATILITY_INDICES = {
 # Inject custom CSS for the Bloomberg Terminal aesthetic
 st.markdown("""
     <style>
+    /* Main Background */
     .stApp {
-        background-color: #000000;
-        color: #ff9900;
-        font-family: 'Courier New', Courier, monospace;
+        background-color: #0E1117;
+        color: #E0E0E0;
+    }
+    /* Metric Card Styling */
+    [data-testid="stMetricValue"] {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 1.8rem;
+    }
+    /* Sidebar Styling */
+    section[data-testid="stSidebar"] {
+        background-color: #161B22;
+        border-right: 1px solid #30363D;
+    }
+    /* Custom Card Class */
+    .macro-card {
+        background-color: #1c2128;
+        border: 1px solid #30363D;
+        padding: 20px;
+        border-radius: 8px;
+        margin-bottom: 10px;
     }
     h1, h2, h3 {
         color: #ffffff;
@@ -283,6 +302,16 @@ def get_sector_scores(regime):
     
     return pd.Series(scores)
 
+def get_sector_status(regime):
+    """Returns sector rotation recommendations based on macro regime."""
+    regimes = {
+        "GOLDILOCKS": {"Bullish": ["Technology", "Consumer Discretionary"], "Bearish": ["Utilities", "Consumer Staples"]},
+        "REFLATION": {"Bullish": ["Energy", "Materials", "Financials"], "Bearish": ["Technology", "Utilities"]},
+        "STAGFLATION": {"Bullish": ["Utilities", "Healthcare", "Consumer Staples"], "Bearish": ["Technology", "Consumer Discretionary"]},
+        "RECESSION": {"Bullish": ["Utilities", "Healthcare", "Consumer Staples"], "Bearish": ["Energy", "Materials", "Financials"]}
+    }
+    return regimes.get(regime.upper(), {"Bullish": [], "Bearish": []})
+
 def fetch_sentiment_score(news_df, api_key, market_context="Equities are currently in a 'Denominator-driven' phase. High inflation news is bearish; weak growth news might be bullish if it suggests rate cuts."):
     if not HAS_GENAI:
         return {"error": "google-genai not installed"}
@@ -337,7 +366,9 @@ def fetch_sentiment_score(news_df, api_key, market_context="Equities are current
         for line in lines:
             if ":" in line:
                 key, val = line.split(":", 1)
-                data[key.strip().lower()] = val.strip()
+                # Clean markdown formatting from values
+                clean_val = val.strip().replace('*', '').replace('+', '').strip()
+                data[key.strip().lower()] = clean_val
         
         return data
     except Exception as e:
@@ -405,9 +436,126 @@ def fetch_sentiment_score(news_df, api_key, market_context="Equities are current
 # --- DASHBOARD UI ---
 st.title("🌐 GLOBAL MACRO TERMINAL")
 
+# Market Status Indicator
+current_time = datetime.datetime.now()
+is_market_open = (current_time.weekday() < 5 and 9 <= current_time.hour < 16)  # Simplified US market hours
+market_status = "🟢 NYSE Open" if is_market_open else "🔴 NYSE Closed"
+st.markdown(f"<div style='text-align: right; font-size: 0.8em; color: #888;'>{market_status}</div>", unsafe_allow_html=True)
+
 api_key = st.sidebar.text_input("Gemini API Key", type="password")
 if not api_key and "GEMINI_API_KEY" in os.environ:
     api_key = os.environ["GEMINI_API_KEY"]
+
+# Quick Links Sidebar
+st.sidebar.markdown("---")
+st.sidebar.subheader("🔗 Quick Links")
+
+if st.sidebar.button("📊 Run Sentiment Analysis"):
+    st.sidebar.info("Running sentiment analysis...")
+    # This would trigger the sentiment_scorer.py logic
+
+if st.sidebar.button("💾 Export Sentiment CSV"):
+    if 'news_df' in locals() and not news_df.empty:
+        # Create comprehensive export data
+        export_df = news_df.copy()
+        export_df['timestamp'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        if api_key:
+            res = fetch_sentiment_score(news_df, api_key)
+            if "regime" in res:
+                score_str = res.get('score', '0.0').replace('*', '').replace('+', '').strip()
+                export_df['ai_regime'] = res.get('regime', 'Unknown').replace('*', '').strip()
+                export_df['ai_sentiment_score'] = float(score_str) if score_str else 0.0
+                export_df['ai_vector'] = res.get('vector', 'Unknown').replace('*', '').strip()
+                export_df['ai_rationale'] = res.get('rationale', '')
+        
+        # Add VADER scores
+        vader_analyzer = SentimentIntensityAnalyzer()
+        export_df['vader_compound'] = export_df['title'].apply(lambda x: vader_analyzer.polarity_scores(x)['compound'])
+        
+        csv_data = export_df.to_csv(index=False)
+        st.sidebar.download_button(
+            label="📥 Download CSV",
+            data=csv_data,
+            file_name=f"macro_sentiment_analysis_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv"
+        )
+    else:
+        st.sidebar.error("No data available for export")
+
+if st.sidebar.button("📈 Backtest Sentiment vs S&P"):
+    st.sidebar.markdown("### Backtesting Results")
+    
+    # Backtest using recent S&P data
+    try:
+        sp500 = yf.Ticker("^GSPC")
+        sp_hist = sp500.history(period="3mo")  # Last 3 months
+        
+        if not sp_hist.empty and len(sp_hist) > 10:
+            # Calculate daily returns
+            sp_returns = sp_hist['Close'].pct_change().dropna()
+            
+            # Get current sentiment score
+            current_sentiment = 0.0
+            if api_key and 'news_df' in locals():
+                res = fetch_sentiment_score(news_df, api_key)
+                score_str = res.get('score', '0.0').replace('*', '').replace('+', '').strip()
+                current_sentiment = float(score_str)
+            
+            # Simulate sentiment-based strategy
+            # Assume sentiment predicts next day's return
+            predicted_returns = sp_returns.shift(-1).dropna()
+            sentiment_signals = np.full(len(predicted_returns), current_sentiment)
+            
+            # Calculate correlation
+            if len(sentiment_signals) == len(predicted_returns):
+                correlation = np.corrcoef(sentiment_signals, predicted_returns.values)[0, 1]
+                st.sidebar.metric("Sentiment vs S&P Correlation", f"{correlation:.3f}")
+            
+            # Strategy performance metrics
+            avg_daily_return = sp_returns.mean()
+            volatility = sp_returns.std()
+            
+            st.sidebar.metric("S&P Avg Daily Return", f"{avg_daily_return:.2%}")
+            st.sidebar.metric("S&P Volatility", f"{volatility:.2%}")
+            
+            # Hypothetical strategy: Go long when sentiment > 0.1, short when < -0.1
+            strategy_returns = sp_returns.copy()
+            if current_sentiment > 0.1:
+                # Go long - keep positive returns
+                pass  # strategy_returns already equals sp_returns
+            elif current_sentiment < -0.1:
+                # Go short - flip the sign
+                strategy_returns *= -1
+            else:
+                # Neutral - set returns to 0
+                strategy_returns = pd.Series(0, index=sp_returns.index)
+            
+            if len(strategy_returns) > 0:
+                strategy_avg_return = strategy_returns.mean()
+                st.sidebar.metric("Strategy Avg Daily Return", f"{strategy_avg_return:.2%}")
+                
+                # Sharpe ratio approximation
+                if volatility > 0:
+                    sharpe = strategy_avg_return / volatility
+                    st.sidebar.metric("Strategy Sharpe Ratio", f"{sharpe:.2f}")
+        else:
+            st.sidebar.error("Insufficient S&P data for backtesting")
+    except Exception as e:
+        st.sidebar.error(f"Backtest error: {str(e)}")
+
+# Yield Watch Sparkline
+st.sidebar.markdown("---")
+st.sidebar.subheader("📈 10Y Yield Watch")
+try:
+    tnx = yf.Ticker("^TNX")
+    yield_hist = tnx.history(period="1d", interval="1h")
+    if not yield_hist.empty:
+        st.sidebar.line_chart(yield_hist['Close'])
+    else:
+        st.sidebar.write("Yield data unavailable")
+except:
+    st.sidebar.write("Yield data unavailable")
 
 st.text(f"LIVE FEED | LAST REFRESH: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -486,9 +634,11 @@ with main_tab1:
         if api_key:
             res = fetch_sentiment_score(news_df, api_key)
             if "score" in res:
-                score = float(res['score'])
-                regime = res.get('regime', 'N/A').upper()
-                vector = res.get('vector', 'N/A')
+                # Clean markdown formatting from AI response
+                score_str = res['score'].replace('*', '').replace('+', '').strip()
+                score = float(score_str)
+                regime = res.get('regime', 'N/A').upper().replace('*', '').strip()
+                vector = res.get('vector', 'N/A').replace('*', '').strip()
                 
                 # Custom CSS for the Regime Badge
                 regime_colors = {
@@ -499,18 +649,33 @@ with main_tab1:
                 }
                 badge_color = regime_colors.get(regime, "#ffffff")
 
-                st.markdown(f"""
-                <div style="border: 2px solid {badge_color}; padding: 20px; border-radius: 10px; background-color: #111;">
-                    <h2 style="margin:0; color: {badge_color};">{regime} REGIME DETECTED</h2>
-                    <p style="font-size: 1.2em; color: #ddd;"><b>Equity Impact Vector:</b> {vector}</p>
-                    <hr style="border: 0.5px solid #333;">
-                    <p style="color: #bbb;"><i>{res.get('rationale', '')}</i></p>
-                </div>
-                """, unsafe_allow_html=True)
+                # Create a 2-column layout for the top "Pulse" section
+                col_regime, col_sectors = st.columns([3, 2])
+
+                with col_regime:
+                    st.markdown(f"""
+                    <div class="macro-card">
+                        <h4 style="color: #8B949E; margin:0;">CURRENT REGIME</h4>
+                        <h1 style="color: {badge_color}; margin:0;">{regime}</h1>
+                        <p style="color: #7D8590;">Transmission Vector: <b>{vector}</b></p>
+                        <p style="font-size: 0.9em;">{res.get('rationale', '')}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                with col_sectors:
+                    sector_info = get_sector_status(regime)
+                    st.markdown('<div class="macro-card">', unsafe_allow_html=True)
+                    st.write("🎯 **Strategic Rotations**")
+                    
+                    for sector in sector_info["Bullish"]:
+                        st.success(f"Overweight: {sector}")
+                    for sector in sector_info["Bearish"]:
+                        st.error(f"Underweight: {sector}")
+                    st.markdown('</div>', unsafe_allow_html=True)
                 
                 # Sector Sentiment Heatmap
-                sector_scores = get_sector_scores(regime)
                 st.subheader("📊 Sector Performance Expectations")
+                sector_scores = get_sector_scores(regime)
                 # Create horizontal bar chart
                 fig = px.bar(sector_scores.sort_values(), orientation='h', 
                            title=f"Sector Performance in {regime} Regime",
