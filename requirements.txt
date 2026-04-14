@@ -5,3 +5,4 @@ pandas
 vaderSentiment
 yfinance
 google-genai
+plotly

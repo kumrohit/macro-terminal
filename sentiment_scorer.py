@@ -37,7 +37,7 @@ def fetch_top_news(limit_per_feed=5):
             print(f"Error loading {source}: {e}")
     return pd.DataFrame(articles)
 
-def analyze_sentiment(df):
+def analyze_sentiment(df, market_context="Market focus is on 'Bad News is Good News'—weak data is bullish as it brings forward Fed rate cuts."):
     """Uses Gemini to score the sentiment of each headline."""
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
@@ -47,19 +47,31 @@ def analyze_sentiment(df):
     
     # Define the system prompt for financial sentiment analysis
     system_instruction = """
-    You are an expert financial quantitative analyst. Your task is to analyze news headlines and determine their immediate sentiment impact on broad global equity markets.
-    
-    Respond STRICTLY in the following format:
-    Score: [A number between -1.0 (highly bearish) to 1.0 (highly bullish), 0.0 is neutral]
-    Rationale: [One short sentence explaining why]
+    You are a Lead Equity Quantitative Strategist. Your task is to analyze headlines through the lens of Equity Risk Premiums and Discounted Cash Flow (DCF) models.
+
+    For each headline, determine:
+    1. REGIME: [Goldilocks, Reflation, Stagflation, or Recession].
+    2. VECTOR: Does this news impact the 'Numerator' (Earnings/Growth) or the 'Denominator' (Interest Rates/Valuation)?
+    3. SCORE: A value from -1.0 (Highly Bearish) to 1.0 (Highly Bullish).
+
+    FORMAT:
+    Score: [score]
+    Rationale: [1 sentence explaining the equity transmission mechanism]
+    Regime: [regime]
+    Vector: [Numerator/Denominator/Both]
     """
     
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Scoring sentiment with Gemini 2.5 Flash...")
     scores = []
     rationales = []
+    regimes = []
+    vectors = []
     
     for idx, row in df.iterrows():
-        prompt = f"Analyze this headline: '{row['title']}' from source: {row['source']}"
+        prompt = f"""
+        Current Market Context: {market_context}
+        Analyze this headline: '{row['title']}' from source: {row['source']}
+        """
         
         try:
             response = client.models.generate_content(
@@ -73,25 +85,43 @@ def analyze_sentiment(df):
             
             # Parse the response
             text = response.text.strip()
-            score_line = [line for line in text.split('\n') if line.startswith('Score:')][0]
-            rationale_line = [line for line in text.split('\n') if line.startswith('Rationale:')][0]
+            lines = text.split('\n')
+            score_line = next((line for line in lines if line.startswith('Score:')), None)
+            rationale_line = next((line for line in lines if line.startswith('Rationale:')), None)
+            regime_line = next((line for line in lines if line.startswith('Regime:')), None)
+            vector_line = next((line for line in lines if line.startswith('Vector:')), None)
             
-            score = float(score_line.replace('Score:', '').strip())
-            rationale = rationale_line.replace('Rationale:', '').strip()
+            if score_line:
+                try:
+                    score = float(score_line.replace('Score:', '').strip())
+                except:
+                    score = 0.0
+            else:
+                score = 0.0
+                
+            rationale = rationale_line.replace('Rationale:', '').strip() if rationale_line else "No rationale provided"
+            regime = regime_line.replace('Regime:', '').strip() if regime_line else "Unknown"
+            vector = vector_line.replace('Vector:', '').strip() if vector_line else "Unknown"
             
             scores.append(score)
             rationales.append(rationale)
+            regimes.append(regime)
+            vectors.append(vector)
             
-            print(f"[{row['source']}] {row['title'][:50]}... -> Score: {score}")
+            print(f"[{row['source']}] {row['title'][:50]}... -> Score: {score}, Regime: {regime}, Vector: {vector}")
             time.sleep(1) # Small delay to avoid aggressive rate limits
             
         except Exception as e:
             print(f"Error analyzing headline '{row['title'][:30]}': {e}")
             scores.append(0.0)
             rationales.append("Error analyzing sentiment.")
+            regimes.append("Unknown")
+            vectors.append("Unknown")
             
     df['sentiment_score'] = scores
     df['rationale'] = rationales
+    df['regime'] = regimes
+    df['vector'] = vectors
     return df
 
 def add_vader_sentiment(df):
@@ -128,9 +158,15 @@ if __name__ == "__main__":
         avg_sentiment_ai = scored_df['sentiment_score'].mean()
         avg_sentiment_vader = scored_df['vader_score'].mean()
         
+        # Determine dominant regime
+        dominant_regime = scored_df['regime'].mode()[0] if not scored_df['regime'].empty else "Unknown"
+        dominant_vector = scored_df['vector'].mode()[0] if not scored_df['vector'].empty else "Unknown"
+        
         print("\n" + "="*50)
         print(f"📈 AGGREGATE MARKET SENTIMENT (AI): {avg_sentiment_ai:.2f}")
         print(f"📈 AGGREGATE MARKET SENTIMENT (VADER): {avg_sentiment_vader:.2f}")
+        print(f"🏛️ DOMINANT MACRO REGIME: {dominant_regime}")
+        print(f"🔄 PRIMARY VECTOR: {dominant_vector}")
         
         # Combine or compare sentiments (Using AI for the final verdict as before, or average them)
         avg_combined = (avg_sentiment_ai + avg_sentiment_vader) / 2
@@ -138,7 +174,7 @@ if __name__ == "__main__":
         
         if avg_combined > 0.15:
             print("Verdict: Bullish 🟢")
-        elif avg_sentiment < -0.2:
+        elif avg_combined < -0.2:
             print("Verdict: Bearish 🔴")
         else:
             print("Verdict: Neutral ⚪")

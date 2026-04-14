@@ -14,6 +14,8 @@ try:
 except ImportError:
     HAS_GENAI = False
 
+import plotly.express as px
+
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Macro Terminal", layout="wide", initial_sidebar_state="collapsed")
 
@@ -22,7 +24,8 @@ INDICES = {
     "NASDAQ": "^IXIC",
     "Dow Jones": "^DJI",
     "Nifty 50": "^NSEI",
-    "Nikkei 225": "^N225"
+    "Nikkei 225": "^N225",
+    "10Y Treasury": "^TNX"
 }
 
 VOLATILITY_INDICES = {
@@ -202,27 +205,170 @@ def fetch_vader_ai_commentary(news_df, vader_score, api_key):
     except Exception as e:
         return None
 
-def fetch_sentiment_score(news_df, api_key):
+def get_sector_scores(regime):
+    """Returns expected sector performance scores based on macro regime."""
+    base_scores = {
+        "Technology": 0,
+        "Consumer Discretionary": 0,
+        "Energy": 0,
+        "Materials": 0,
+        "Industrials": 0,
+        "Utilities": 0,
+        "Healthcare": 0,
+        "Consumer Staples": 0,
+        "Financials": 0,
+        "Real Estate": 0
+    }
+    
+    regime = regime.upper()
+    if regime == "GOLDILOCKS":
+        # High beta sectors perform best
+        scores = {
+            "Technology": 0.8,
+            "Consumer Discretionary": 0.7,
+            "Financials": 0.6,
+            "Real Estate": 0.5,
+            "Industrials": 0.4,
+            "Materials": 0.3,
+            "Energy": 0.2,
+            "Healthcare": 0.1,
+            "Consumer Staples": 0.0,
+            "Utilities": -0.1
+        }
+    elif regime == "REFLATION":
+        # Cyclical sectors benefit from rising growth/inflation
+        scores = {
+            "Energy": 0.8,
+            "Materials": 0.7,
+            "Industrials": 0.6,
+            "Financials": 0.5,
+            "Consumer Discretionary": 0.4,
+            "Technology": 0.3,
+            "Real Estate": 0.2,
+            "Healthcare": 0.0,
+            "Consumer Staples": -0.1,
+            "Utilities": -0.2
+        }
+    elif regime == "STAGFLATION":
+        # All sectors suffer, but some less
+        scores = {
+            "Healthcare": 0.2,
+            "Consumer Staples": 0.1,
+            "Utilities": 0.0,
+            "Technology": -0.1,
+            "Consumer Discretionary": -0.2,
+            "Financials": -0.3,
+            "Industrials": -0.4,
+            "Materials": -0.5,
+            "Energy": -0.6,
+            "Real Estate": -0.7
+        }
+    elif regime == "RECESSION":
+        # Defensive sectors outperform
+        scores = {
+            "Utilities": 0.6,
+            "Healthcare": 0.5,
+            "Consumer Staples": 0.4,
+            "Real Estate": 0.2,
+            "Technology": 0.1,
+            "Financials": 0.0,
+            "Consumer Discretionary": -0.1,
+            "Industrials": -0.2,
+            "Materials": -0.3,
+            "Energy": -0.4
+        }
+    else:
+        # Neutral/default
+        scores = base_scores
+    
+    return pd.Series(scores)
+
+def fetch_sentiment_score(news_df, api_key, market_context="Equities are currently in a 'Denominator-driven' phase. High inflation news is bearish; weak growth news might be bullish if it suggests rate cuts."):
     if not HAS_GENAI:
-        return None, "google-genai not installed"
+        return {"error": "google-genai not installed"}
         
     if not api_key:
-        return None, "GEMINI_API_KEY not set"
+        return {"error": "GEMINI_API_KEY not set"}
         
     client = genai.Client(api_key=api_key)
     
     system_instruction = """
-    You are an expert financial quantitative analyst. Your task is to analyze a batch of news headlines and determine their immediate aggregate sentiment impact on broad global equity markets.
-    
-    Respond STRICTLY in the following format:
-    Score: [A number between -1.0 (highly bearish) to 1.0 (highly bullish), 0.0 is neutral]
-    Rationale: [One short sentence explaining why]
-    Commentary: [A brief 2-3 sentence paragraph summarizing the key themes driving this sentiment and what traders should watch for.]
+    You are a Lead Equity Quantitative Strategist. Your task is to analyze a batch of news headlines through the lens of Equity Risk Premiums and Discounted Cash Flow (DCF) models.
+
+    Determine the dominant macro regime from these headlines:
+
+    REGIMES:
+    * Goldilocks: Growth stable/rising, Inflation falling (Highest Equity returns).
+    * Reflation: Growth rising, Inflation rising (Bullish for Value/Cyclicals).
+    * Stagflation: Growth falling, Inflation rising (Highly Bearish).
+    * Recession: Growth falling, Inflation falling (Bearish, but potential for rate cuts).
+
+    Also determine the primary VECTOR: Does the news primarily impact the 'Numerator' (Earnings/Growth) or the 'Denominator' (Interest Rates/Valuation)?
+
+    Respond with:
+    Regime: [dominant regime]
+    Score: [aggregate score -1.0 to 1.0]
+    Rationale: [1 sentence explaining the equity transmission mechanism]
+    Commentary: [brief 2-3 sentence summary]
+    Vector: [primary vector: Numerator/Denominator/Both]
     """
     
     # Just take the top 10 headlines to avoid massive prompts
     headlines = news_df['title'].head(10).tolist()
-    prompt = "Analyze the aggregate sentiment of these current headlines:\n" + "\n".join([f"- {h}" for h in headlines])
+    prompt = f"Current Market Context: {market_context}\nAnalyze the aggregate sentiment of these current headlines:\n" + "\n".join([f"- {h}" for h in headlines])
+    
+    try:
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=0.1,
+            )
+        )
+        text = response.text.strip()
+        print("RAW GEMINI RESPONSE:")
+        print(text)
+        print("-" * 40)
+        
+        # New parsing logic for the multi-line response
+        lines = [l.strip() for l in text.split('\n') if l.strip()]
+        data = {}
+        for line in lines:
+            if ":" in line:
+                key, val = line.split(":", 1)
+                data[key.strip().lower()] = val.strip()
+        
+        return data
+    except Exception as e:
+        return {"error": str(e)}
+        
+    client = genai.Client(api_key=api_key)
+    
+    system_instruction = """
+    You are a Lead Equity Quantitative Strategist. Your task is to analyze a batch of news headlines through the lens of Equity Risk Premiums and Discounted Cash Flow (DCF) models.
+
+    Determine the dominant macro regime from these headlines:
+
+    REGIMES:
+    * Goldilocks: Growth stable/rising, Inflation falling (Highest Equity returns).
+    * Reflation: Growth rising, Inflation rising (Bullish for Value/Cyclicals).
+    * Stagflation: Growth falling, Inflation rising (Highly Bearish).
+    * Recession: Growth falling, Inflation falling (Bearish, but potential for rate cuts).
+
+    Also determine the primary VECTOR: Does the news primarily impact the 'Numerator' (Earnings/Growth) or the 'Denominator' (Interest Rates/Valuation)?
+
+    Respond with:
+    Regime: [dominant regime]
+    Score: [aggregate score -1.0 to 1.0]
+    Rationale: [1 sentence explaining the equity transmission mechanism]
+    Commentary: [brief 2-3 sentence summary]
+    Vector: [primary vector: Numerator/Denominator/Both]
+    """
+    
+    # Just take the top 10 headlines to avoid massive prompts
+    headlines = news_df['title'].head(10).tolist()
+    prompt = f"Current Market Context: {market_context}\nAnalyze the aggregate sentiment of these current headlines:\n" + "\n".join([f"- {h}" for h in headlines])
     
     try:
         response = client.models.generate_content(
@@ -241,31 +387,20 @@ def fetch_sentiment_score(news_df, api_key):
         score = 0.0
         rationale = "No rationale provided"
         commentary = "No commentary provided"
+        regime = "Unknown"
+        vector = "Unknown"
         
-        # Improved parsing
-        lines = [line.strip() for line in text.split('\\n') if line.strip()]
-        for i, line in enumerate(lines):
-            clean_line = line.replace('*', '').strip()
-            if clean_line.lower().startswith('score:'):
-                try:
-                    score = float(clean_line.split(':', 1)[1].strip())
-                except:
-                    pass
-            elif clean_line.lower().startswith('rationale:'):
-                rationale = clean_line.split(':', 1)[1].strip()
-            elif clean_line.lower().startswith('commentary:'):
-                commentary = clean_line.split(':', 1)[1].strip()
-                # If commentary is multi-line, grab the rest of the lines
-                if i + 1 < len(lines):
-                    commentary += " " + " ".join(lines[i+1:])
-                break # Commentary is the last field
-                
-        if not commentary or commentary == "No commentary provided":
-            commentary = f"Raw LLM output: {text}"
-            
-        return score, rationale, commentary
+        # New parsing logic for the multi-line response
+        lines = [l.strip() for l in text.split('\n') if l.strip()]
+        data = {}
+        for line in lines:
+            if ":" in line:
+                key, val = line.split(":", 1)
+                data[key.strip().lower()] = val.strip()
+        
+        return data
     except Exception as e:
-        return None, f"Error: {str(e)}", ""
+        return {"error": str(e)}
 
 # --- DASHBOARD UI ---
 st.title("🌐 GLOBAL MACRO TERMINAL")
@@ -349,29 +484,43 @@ with main_tab1:
         """, unsafe_allow_html=True)
 
         if api_key:
-            score, rationale, commentary = fetch_sentiment_score(news_df, api_key)
-            if score is not None:
-                if score > 0.2:
-                    color = "#00ff00" # Green
-                    verdict = "BULLISH 🟢"
-                elif score < -0.2:
-                    color = "#ff0000" # Red
-                    verdict = "BEARISH 🔴"
-                else:
-                    color = "#ffffff" # White
-                    verdict = "NEUTRAL ⚪"
-                    
+            res = fetch_sentiment_score(news_df, api_key)
+            if "score" in res:
+                score = float(res['score'])
+                regime = res.get('regime', 'N/A').upper()
+                vector = res.get('vector', 'N/A')
+                
+                # Custom CSS for the Regime Badge
+                regime_colors = {
+                    "GOLDILOCKS": "#00ff00", # Bright Green
+                    "REFLATION": "#00ffff",  # Cyan
+                    "STAGFLATION": "#ff0000",# Red
+                    "RECESSION": "#ff9900"   # Orange
+                }
+                badge_color = regime_colors.get(regime, "#ffffff")
+
                 st.markdown(f"""
-                <div style="border: 1px solid #333; padding: 15px; margin-bottom: 20px; background-color: #111;">
-                    <h3 style="margin-top: 0; color: {color};">🤖 AI MARKET SENTIMENT: {score} ({verdict})</h3>
-                    <p style="color: #ccc; margin-bottom: 10px;"><i>{rationale}</i></p>
-                    <div style="border-top: 1px dashed #444; padding-top: 10px; color: #ddd; font-size: 0.9em;">
-                        <strong>Macro Commentary:</strong> {commentary}
-                    </div>
+                <div style="border: 2px solid {badge_color}; padding: 20px; border-radius: 10px; background-color: #111;">
+                    <h2 style="margin:0; color: {badge_color};">{regime} REGIME DETECTED</h2>
+                    <p style="font-size: 1.2em; color: #ddd;"><b>Equity Impact Vector:</b> {vector}</p>
+                    <hr style="border: 0.5px solid #333;">
+                    <p style="color: #bbb;"><i>{res.get('rationale', '')}</i></p>
                 </div>
                 """, unsafe_allow_html=True)
+                
+                # Sector Sentiment Heatmap
+                sector_scores = get_sector_scores(regime)
+                st.subheader("📊 Sector Performance Expectations")
+                # Create horizontal bar chart
+                fig = px.bar(sector_scores.sort_values(), orientation='h', 
+                           title=f"Sector Performance in {regime} Regime",
+                           labels={'value': 'Expected Performance', 'index': 'Sector'},
+                           color=sector_scores.sort_values(),
+                           color_continuous_scale=['red', 'yellow', 'green'])
+                fig.update_layout(showlegend=False)
+                st.plotly_chart(fig)
             else:
-                st.warning(f"AI Sentiment Unavailable: {rationale}")
+                st.warning(f"AI Sentiment Unavailable: {res.get('error', 'Unknown error')}")
         else:
             st.info("💡 Enter your Gemini API Key in the sidebar to enable AI Sentiment Analysis!")
 
