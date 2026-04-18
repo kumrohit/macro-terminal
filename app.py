@@ -5,6 +5,7 @@ import requests
 import datetime
 import time
 import os
+import re
 import yfinance as yf
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 try:
@@ -88,10 +89,12 @@ st.markdown("""
 RSS_FEEDS = {
     "Investing.com (Macro)": "https://www.investing.com/rss/news_286.rss",
     "CNBC (World)": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100727362",
-    "Yahoo Finance": "https://finance.yahoo.com/news/rss"
+    "Yahoo Finance": "https://finance.yahoo.com/news/rss",
+    "Reuters (Business)": "https://feeds.reuters.com/reuters/businessNews",
+    "MarketWatch": "https://feeds.marketwatch.com/marketwatch/topstories/",
 }
 
-@st.cache_data(ttl=300) # Cache for 5 mins to avoid spamming feeds
+@st.cache_data(ttl=300)
 def fetch_news():
     articles = []
     headers = {
@@ -99,15 +102,22 @@ def fetch_news():
     }
     for source, url in RSS_FEEDS.items():
         try:
-            # Fetch using requests to bypass basic anti-bot protections
             response = requests.get(url, headers=headers, timeout=10)
             feed = feedparser.parse(response.content)
-            for entry in feed.entries[:10]:  # Top 10 from each
+            for entry in feed.entries[:8]:
+                # Extract summary/description if available, strip HTML tags
+                raw_summary = entry.get('summary', entry.get('description', ''))
+                # Strip HTML tags with a simple regex
+                import re
+                clean_summary = re.sub(r'<[^>]+>', '', raw_summary).strip()
+                clean_summary = clean_summary[:300] + '...' if len(clean_summary) > 300 else clean_summary
+
                 articles.append({
                     "title": entry.title,
                     "link": entry.link,
                     "published": entry.get('published', 'Just now'),
-                    "source": source
+                    "source": source,
+                    "summary": clean_summary,
                 })
         except Exception as e:
             st.sidebar.error(f"Error loading {source}: {e}")
@@ -115,45 +125,81 @@ def fetch_news():
 
 import xml.etree.ElementTree as ET
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=300)  # Reduced from 3600 to 300 for day traders — calendar updates as actuals come in
 def fetch_calendar():
-    # ForexFactory daily XML feed for economic events
     try:
         url = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
         headers = {
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         }
         response = requests.get(url, headers=headers, timeout=10)
-        
-        # Check if we got rate limited (returns HTML instead of XML)
-        if b"Rate Limited" in response.content or b"<!DOCTYPE html>" in response.content:
-            st.sidebar.warning("ForexFactory is temporarily rate-limiting our calendar requests. It will automatically recover in a few minutes.")
-            return pd.DataFrame({"Info": ["Calendar rate-limited. Please wait 5 mins."]})
 
-        # Parse XML manually to avoid pandas lxml dependency issues
+        if b"Rate Limited" in response.content or b"<!DOCTYPE html>" in response.content:
+            st.sidebar.warning("ForexFactory rate-limiting active. Will retry automatically.")
+            return pd.DataFrame()
+
         root = ET.fromstring(response.content)
         events = []
         for event in root.findall('event'):
-            impact = event.find('impact').text if event.find('impact') is not None else ''
-            if impact == 'High':
-                events.append({
-                    'Date': event.find('date').text if event.find('date') is not None else '',
-                    'Time': event.find('time').text if event.find('time') is not None else '',
-                    'Curr': event.find('currency').text if event.find('currency') is not None else '',
-                    'Event': event.find('title').text if event.find('title') is not None else '',
-                    'Actual': event.find('actual').text if event.find('actual') is not None else '',
-                    'Forecast': event.find('forecast').text if event.find('forecast') is not None else '',
-                    'Previous': event.find('previous').text if event.find('previous') is not None else ''
-                })
-                
+            impact = event.find('impact').text if event.find('impact') is not None else 'Low'
+            # Include High AND Medium for day traders — Medium events still move intraday
+            if impact not in ('High', 'Medium'):
+                continue
+
+            title_text  = event.find('title').text    if event.find('title')    is not None else ''
+            date_text   = event.find('date').text     if event.find('date')     is not None else ''
+            time_text   = event.find('time').text     if event.find('time')     is not None else ''
+            currency    = event.find('currency').text if event.find('currency') is not None else ''
+            actual      = event.find('actual').text   if event.find('actual')   is not None else ''
+            forecast    = event.find('forecast').text if event.find('forecast') is not None else ''
+            previous    = event.find('previous').text if event.find('previous') is not None else ''
+
+            # Beat / Miss / Pending logic
+            beat_miss = ''
+            if actual and forecast:
+                try:
+                    act_val  = float(actual.replace('%','').replace('K','000').replace('M','000000').strip())
+                    fore_val = float(forecast.replace('%','').replace('K','000').replace('M','000000').strip())
+                    if act_val > fore_val:
+                        beat_miss = '✅ Beat'
+                    elif act_val < fore_val:
+                        beat_miss = '❌ Miss'
+                    else:
+                        beat_miss = '➖ In-line'
+                except ValueError:
+                    beat_miss = ''
+            elif not actual:
+                beat_miss = '⏳ Pending'
+
+            events.append({
+                'Date':     date_text,
+                'Time (ET)': time_text,
+                'Ccy':      currency,
+                'Event':    title_text,
+                'Impact':   impact,
+                'Actual':   actual   if actual   else '—',
+                'Forecast': forecast if forecast else '—',
+                'Previous': previous if previous else '—',
+                'Result':   beat_miss,
+            })
+
         if not events:
-            return pd.DataFrame({"Info": ["No high-impact events found this week."]})
-            
-        return pd.DataFrame(events)
-        
+            return pd.DataFrame()
+
+        df = pd.DataFrame(events)
+
+        # Sort: today's events first, then by time
+        # Parse date for sorting — ForexFactory uses format like "Friday January 17"
+        # We use a stable sort on the raw order (XML is already chronological)
+        # Just put events without actuals (pending) at the top within each day
+        df['_sort'] = df['Result'].apply(lambda x: 0 if x == '⏳ Pending' else 1)
+        df = df.sort_values(['Date', '_sort', 'Time (ET)']).drop(columns=['_sort'])
+
+        return df
+
     except Exception as e:
-        st.sidebar.error(f"Error loading calendar: {e}")
-        return pd.DataFrame({"Error": ["Could not load calendar data."]})
+        st.sidebar.error(f"Calendar error: {e}")
+        return pd.DataFrame()
 
 @st.cache_data(ttl=60)
 def fetch_ticker_data(ticker_dict):
@@ -223,6 +269,84 @@ def fetch_vader_ai_commentary(news_df, vader_score, api_key):
         return response.text.strip()
     except Exception as e:
         return None
+
+@st.cache_data(ttl=300)
+def analyze_news_with_ai(news_df_json: str, api_key: str) -> str:
+    """
+    Accepts news_df as JSON string (for cache compatibility),
+    returns enriched DataFrame as JSON string.
+    Adds 'impact' (HIGH/MEDIUM/LOW) and 'ai_commentary' columns.
+    """
+    if not HAS_GENAI or not api_key:
+        return news_df_json  # Return unchanged if no AI available
+
+    import json
+    try:
+        news_df = pd.read_json(pd.io.common.StringIO(news_df_json))
+    except ValueError:
+        news_df = pd.DataFrame(json.loads(news_df_json))
+    client = genai.Client(api_key=api_key)
+
+    system_instruction = """
+You are a senior sell-side macro analyst covering equities and rates.
+For each news headline and summary you receive, return ONLY a JSON array.
+Each element must have exactly these keys:
+  "impact": one of "HIGH", "MEDIUM", or "LOW"
+  "commentary": a single sentence (max 20 words) explaining the market transmission — which asset class moves, in which direction, and why.
+
+Impact classification rules:
+  HIGH   — Central bank decisions, CPI/PCE/NFP prints, GDP, geopolitical escalations, systemic bank events
+  MEDIUM — Earnings beats/misses from large-caps, trade policy updates, regional data prints, M&A
+  LOW    — Analyst upgrades/downgrades, routine corporate news, general commentary
+
+Be precise. Mention the specific instrument that moves (e.g. "USD strengthens", "10Y yields rise", "Nasdaq sells off").
+Return ONLY the JSON array, no markdown, no preamble.
+"""
+
+    headlines_payload = []
+    for i, row in news_df.iterrows():
+        headlines_payload.append({
+            "id": i,
+            "title": row.get('title', ''),
+            "summary": row.get('summary', '')[:200],
+            "source": row.get('source', '')
+        })
+
+    prompt = f"Analyze these {len(headlines_payload)} news items:\n{json.dumps(headlines_payload, indent=2)}"
+
+    try:
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=0.1,
+            )
+        )
+        raw = response.text.strip()
+        # Strip markdown code fences if present
+        raw = raw.replace('```json', '').replace('```', '').strip()
+        results = json.loads(raw)
+
+        impacts = []
+        commentaries = []
+        for item in results:
+            impacts.append(item.get('impact', 'MEDIUM'))
+            commentaries.append(item.get('commentary', ''))
+
+        # Pad if AI returned fewer items than expected
+        while len(impacts) < len(news_df):
+            impacts.append('MEDIUM')
+            commentaries.append('')
+
+        news_df['impact'] = impacts[:len(news_df)]
+        news_df['ai_commentary'] = commentaries[:len(news_df)]
+
+    except Exception:
+        news_df['impact'] = 'MEDIUM'
+        news_df['ai_commentary'] = ''
+
+    return news_df.to_json()
 
 def get_sector_scores(regime):
     """Returns expected sector performance scores based on macro regime."""
@@ -559,7 +683,12 @@ except:
 
 st.text(f"LIVE FEED | LAST REFRESH: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-main_tab1, main_tab2, main_tab3 = st.tabs(["🌍 Markets & Sentiment", "📰 Macro News & Calendar", "🏢 Company Financials"])
+main_tab1, main_tab2, main_tab_cal, main_tab3 = st.tabs([
+    "🌍 Markets & Sentiment",
+    "📰 Macro News",
+    "📅 Economic Calendar",
+    "🏢 Company Financials"
+])
 
 with main_tab1:
     # --- GLOBAL MARKETS TICKER ---
@@ -690,26 +819,230 @@ with main_tab1:
             st.info("💡 Enter your Gemini API Key in the sidebar to enable AI Sentiment Analysis!")
 
 with main_tab2:
-    if 'news_df' not in locals():
-        news_df = fetch_news()
-    
-    col1, col2 = st.columns([2, 1])
+    news_df = fetch_news()
 
-    with col1:
-        st.subheader("📰 Breaking Macro News")
-        
-        if not news_df.empty:
-            for _, row in news_df.iterrows():
-                st.markdown(f"<div class='news-title'><a href='{row['link']}' target='_blank'>{row['title']}</a></div>", unsafe_allow_html=True)
-                st.markdown(f"<div class='news-source'>[{row['source']}] - {row['published']}</div><br>", unsafe_allow_html=True)
+    st.markdown("### 📰 Macro News Feed")
 
-    with col2:
-        st.subheader("📅 High-Impact Calendar")
-        cal_df = fetch_calendar()
-        if not cal_df.empty:
-            st.dataframe(cal_df, hide_index=True, use_container_width=True)
+    # Impact filter controls
+    filter_col1, filter_col2, filter_col3 = st.columns([2, 2, 1])
+    with filter_col1:
+        source_filter = st.multiselect(
+            "Filter by source",
+            options=list(RSS_FEEDS.keys()),
+            default=list(RSS_FEEDS.keys()),
+            label_visibility="collapsed",
+            placeholder="All sources"
+        )
+    with filter_col2:
+        impact_filter = st.multiselect(
+            "Filter by impact",
+            options=["HIGH", "MEDIUM", "LOW"],
+            default=["HIGH", "MEDIUM"],
+            label_visibility="collapsed",
+            placeholder="All impacts"
+        )
+    with filter_col3:
+        use_ai_news = st.toggle("AI Analysis", value=bool(api_key))
+
+    if not news_df.empty:
+        # Apply source filter
+        display_df = news_df[news_df['source'].isin(source_filter)] if source_filter else news_df
+
+        # Run AI enrichment if toggled on and API key exists
+        if use_ai_news and api_key:
+            with st.spinner("Analysing news impact with Gemini..."):
+                enriched_json = analyze_news_with_ai(display_df.to_json(), api_key)
+                display_df = pd.read_json(pd.io.common.StringIO(enriched_json))
         else:
-            st.write("No high impact events found.")
+            # Add empty columns so rendering code below always works
+            if 'impact' not in display_df.columns:
+                display_df = display_df.copy()
+                display_df['impact'] = 'MEDIUM'
+                display_df['ai_commentary'] = ''
+
+        # Apply impact filter (only meaningful after AI enrichment)
+        if use_ai_news and api_key and impact_filter:
+            display_df = display_df[display_df['impact'].isin(impact_filter)]
+
+        # Impact badge colours
+        impact_styles = {
+            'HIGH':   ('background:#ff000022; color:#ff4444; border:1px solid #ff4444;', '🔴 HIGH'),
+            'MEDIUM': ('background:#ff990022; color:#ff9900; border:1px solid #ff9900;', '🟡 MEDIUM'),
+            'LOW':    ('background:#00ff0022; color:#00cc44; border:1px solid #00cc44;', '🟢 LOW'),
+        }
+
+        for _, row in display_df.iterrows():
+            impact_val = str(row.get('impact', 'MEDIUM')).upper()
+            commentary = row.get('ai_commentary', '')
+            
+            # Create a container for each news item
+            with st.container():
+                # Header row with impact badge and metadata
+                col1, col2 = st.columns([1, 3])
+                with col1:
+                    if impact_val == 'HIGH':
+                        st.error("🔴 HIGH")
+                    elif impact_val == 'MEDIUM':
+                        st.warning("🟡 MEDIUM")
+                    else:
+                        st.success("🟢 LOW")
+                with col2:
+                    st.caption(f"{row['source']} · {row['published']}")
+                
+                # Title as clickable link
+                st.markdown(f"**[{row['title']}]({row['link']})**")
+                
+                # AI commentary if available
+                if commentary:
+                    st.info(f"💬 {commentary}")
+                
+                # Summary if available
+                if row.get('summary'):
+                    st.write(row['summary'][:200])
+                
+                st.divider()
+    else:
+        st.warning("No news available. Check your internet connection.")
+
+with main_tab_cal:
+    st.markdown("### 📅 Economic Calendar — Day Trader View")
+
+    cal_df = fetch_calendar()
+
+    if cal_df.empty:
+        st.info("No Medium or High impact events found this week, or the calendar feed is temporarily unavailable.")
+    else:
+        # ── Summary metrics row ──────────────────────────────────────────
+        total_events  = len(cal_df)
+        pending       = len(cal_df[cal_df['Result'] == '⏳ Pending'])
+        beats         = len(cal_df[cal_df['Result'] == '✅ Beat'])
+        misses        = len(cal_df[cal_df['Result'] == '❌ Miss'])
+        high_impact   = len(cal_df[cal_df['Impact'] == 'High'])
+
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Total Events",    total_events)
+        m2.metric("⏳ Pending",       pending)
+        m3.metric("✅ Beats",         beats)
+        m4.metric("❌ Misses",        misses)
+        m5.metric("🔴 High Impact",   high_impact)
+
+        st.markdown("<hr style='border:1px solid #222;'>", unsafe_allow_html=True)
+
+        # ── Filters ──────────────────────────────────────────────────────
+        fc1, fc2, fc3 = st.columns([2, 2, 2])
+        with fc1:
+            all_currencies = sorted(cal_df['Ccy'].dropna().unique().tolist())
+            selected_ccys = st.multiselect("Currency", all_currencies,
+                                           default=[c for c in ['USD','EUR','GBP','JPY','CNY'] if c in all_currencies],
+                                           placeholder="All currencies")
+        with fc2:
+            selected_impact = st.multiselect("Impact level", ['High','Medium'],
+                                              default=['High','Medium'])
+        with fc3:
+            selected_result = st.multiselect("Result", ['⏳ Pending','✅ Beat','❌ Miss','➖ In-line'],
+                                              default=['⏳ Pending','✅ Beat','❌ Miss','➖ In-line'],
+                                              placeholder="All results")
+
+        filtered = cal_df.copy()
+        if selected_ccys:
+            filtered = filtered[filtered['Ccy'].isin(selected_ccys)]
+        if selected_impact:
+            filtered = filtered[filtered['Impact'].isin(selected_impact)]
+        if selected_result:
+            filtered = filtered[filtered['Result'].isin(selected_result)]
+
+        st.markdown(f"Showing {len(filtered)} of {len(cal_df)} events")
+
+        # ── Render events grouped by date ────────────────────────────────
+        if filtered.empty:
+            st.info("No events match the current filters.")
+        else:
+            for date_val, day_group in filtered.groupby('Date', sort=False):
+                st.subheader(f"📆 {date_val}")
+
+                for _, row in day_group.iterrows():
+                    impact = row['Impact']
+                    result = row['Result']
+                    is_pending = result == '⏳ Pending'
+
+                    with st.container():
+                        # Header with time, impact, result, currency
+                        cols = st.columns([2, 1, 1, 1, 4])
+                        cols[0].write(f"**{row['Time (ET)']}**")
+                        
+                        if impact == 'High':
+                            cols[1].error("HIGH")
+                        else:
+                            cols[1].warning("MEDIUM")
+                        
+                        if result == '✅ Beat':
+                            cols[2].success("BEAT")
+                        elif result == '❌ Miss':
+                            cols[2].error("MISS")
+                        elif result == '➖ In-line':
+                            cols[2].write("IN-LINE")
+                        else:
+                            cols[2].info("PENDING")
+                        
+                        cols[3].code(f"[{row['Ccy']}]")
+                        cols[4].write(f"**{row['Event']}**")
+                        
+                        # Data row for Previous/Forecast/Actual
+                        if not is_pending:
+                            data_cols = st.columns(3)
+                            data_cols[0].metric("Previous", row['Previous'])
+                            data_cols[1].metric("Forecast", row['Forecast'])
+                            if '✅' in result:
+                                data_cols[2].metric("Actual", row['Actual'], delta="Beat")
+                            elif '❌' in result:
+                                data_cols[2].metric("Actual", row['Actual'], delta="Miss")
+                            else:
+                                data_cols[2].metric("Actual", row['Actual'])
+                        else:
+                            st.info("⏳ Awaiting release")
+                        
+                        st.divider()
+
+        # ── AI Calendar Commentary (optional) ────────────────────────────
+        if api_key and not filtered.empty:
+            st.divider()
+            st.markdown("#### 🤖 AI Calendar Briefing")
+
+            if st.button("Generate today's event briefing", key="cal_briefing_btn"):
+                pending_events = filtered[filtered['Result'] == '⏳ Pending']
+                released_events = filtered[filtered['Result'] != '⏳ Pending']
+
+                briefing_prompt = f"""
+You are a macro strategist writing a pre-market briefing for day traders.
+
+Released events (with actual vs forecast):
+{released_events[['Event','Ccy','Actual','Forecast','Previous','Result']].to_string(index=False) if not released_events.empty else 'None yet.'}
+
+Upcoming pending events:
+{pending_events[['Time (ET)','Event','Ccy','Forecast','Previous']].to_string(index=False) if not pending_events.empty else 'None remaining.'}
+
+Write a structured briefing with three sections:
+1. WHAT ALREADY PRINTED — 2-3 sentences summarising the beats/misses and their market impact
+2. WATCH LIST — bullet points for each pending high-impact event: what to expect and which instrument to watch (e.g. DXY, SPX, Gold)
+3. OVERALL BIAS — one sentence: bullish/bearish/neutral for equities today, and why
+
+Keep it under 200 words. Use plain text, no markdown headers.
+"""
+                client = genai.Client(api_key=api_key)
+                with st.spinner("Generating briefing..."):
+                    try:
+                        response = client.models.generate_content(
+                            model='gemini-2.5-flash',
+                            contents=briefing_prompt,
+                            config=types.GenerateContentConfig(temperature=0.2)
+                        )
+                        briefing_text = response.text.strip()
+                        st.success("Briefing generated:")
+                        st.write(briefing_text)
+                    except Exception as e:
+                        st.error(f"Briefing generation failed: {e}")
+        elif not api_key:
+            st.info("💡 Add your Gemini API key in the sidebar to enable the AI Calendar Briefing.")
 
 with main_tab3:
     st.subheader("🏢 Company Financials Terminal")
